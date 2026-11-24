@@ -168,12 +168,17 @@ export const DEFAULT_PARAMS: Params = {
 const LAMPORTS = 1e9;
 const CURVE_FEE = 0.0125;
 
-interface Trade {
-  slot: number;
-  buy: boolean;
-  sol: number;
-  user: string;
-  price: number;
+/** Per-slot flow aggregates for one mint: the trades of a single slot, folded as
+ * they arrive, so the entry signal sums at most ~30 small groups instead of
+ * re-scanning every trade of a hot mint on every batch (a mint can print
+ * hundreds of trades in one slot; the old per-trade scan was the bot's whole
+ * per-batch cost and the slowest single batch). */
+interface SlotAgg {
+  buySol: number;
+  sellSol: number;
+  buys: number;
+  high: number;
+  byUser: Map<string, number>;
 }
 
 interface Tape {
@@ -181,7 +186,8 @@ interface Tape {
   creator: string | null;
   createPrice: number;
   devSold: boolean;
-  trades: Trade[];
+  /** Flow aggregates by slot (only slots within `keep` of now are kept). */
+  slots: Map<number, SlotAgg>;
   entries: number;
   lastExit: number;
 }
@@ -217,7 +223,7 @@ export function createStrategy(p: Params = DEFAULT_PARAMS): Bot {
   const tapeOf = (mint: Pubkey): Tape => {
     let t = tapes.get(mint);
     if (t === undefined) {
-      t = { created: null, creator: null, createPrice: 0, devSold: false, trades: [], entries: 0, lastExit: -1e12 };
+      t = { created: null, creator: null, createPrice: 0, devSold: false, slots: new Map(), entries: 0, lastExit: -1e12 };
       tapes.set(mint, t);
     }
     return t;
@@ -246,19 +252,16 @@ export function createStrategy(p: Params = DEFAULT_PARAMS): Bot {
     let netNew = 0;
     let high = 0;
     const byUser = new Map<string, number>();
-    for (const tr of t.trades) {
-      if (tr.slot <= from) continue;
-      const signed = tr.buy ? tr.sol : -tr.sol;
-      if (tr.slot <= mid) netOld += signed;
-      else netNew += signed;
-      if (tr.buy) {
-        buySol += tr.sol;
-        buys++;
-        byUser.set(tr.user, (byUser.get(tr.user) ?? 0) + tr.sol);
-      } else {
-        sellSol += tr.sol;
-      }
-      if (tr.price > high) high = tr.price;
+    for (const [slot, g] of t.slots) {
+      if (slot <= from) continue;
+      const net = g.buySol - g.sellSol;
+      if (slot <= mid) netOld += net;
+      else netNew += net;
+      buySol += g.buySol;
+      sellSol += g.sellSol;
+      buys += g.buys;
+      if (g.high > high) high = g.high;
+      for (const [user, sol] of g.byUser) byUser.set(user, (byUser.get(user) ?? 0) + sol);
     }
     if (buys < (tier === 'strong' ? p.minBuys : p.scoutMinBuys) || byUser.size < (tier === 'strong' ? p.minBuyers : p.scoutMinBuyers)) return false;
     if (buySol - sellSol < (tier === 'strong' ? p.minNetSol : p.scoutMinNetSol)) return false;
@@ -295,7 +298,20 @@ export function createStrategy(p: Params = DEFAULT_PARAMS): Bot {
         } else if (e.event === 'TradeEvent') {
           const t = tapeOf(e.mint);
           const sol = Number(e.sol_amount) / LAMPORTS;
-          t.trades.push({ slot: e.slot, buy: e.is_buy, sol, user: e.user, price: Number(e.virtual_quote_reserves) / Number(e.virtual_token_reserves) });
+          const price = Number(e.virtual_quote_reserves) / Number(e.virtual_token_reserves);
+          let g = t.slots.get(e.slot);
+          if (g === undefined) {
+            g = { buySol: 0, sellSol: 0, buys: 0, high: 0, byUser: new Map() };
+            t.slots.set(e.slot, g);
+          }
+          if (e.is_buy) {
+            g.buySol += sol;
+            g.buys++;
+            g.byUser.set(e.user, (g.byUser.get(e.user) ?? 0) + sol);
+          } else {
+            g.sellSol += sol;
+          }
+          if (price > g.high) g.high = price;
           traded.add(e.mint);
           if (!e.is_buy && t.creator !== null && e.user === t.creator) t.devSold = true;
           if (!e.is_buy && sol >= p.bigSellSol) bigSell.add(e.mint);
@@ -307,9 +323,7 @@ export function createStrategy(p: Params = DEFAULT_PARAMS): Bot {
       }
       for (const mint of traded) {
         const t = tapes.get(mint)!;
-        let cut = 0;
-        while (cut < t.trades.length && t.trades[cut]!.slot <= now - keep) cut++;
-        if (cut > 0) t.trades.splice(0, cut);
+        for (const slot of t.slots.keys()) if (slot <= now - keep) t.slots.delete(slot);
       }
       const marks = new Map(batch.marks.map((m) => [m.mint, m] as const));
       const pendingByMint = new Map<Pubkey, number>();
